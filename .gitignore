@@ -3,4 +3,6 @@ Session.vim
 *.swp
 .DS_Store
 MinHashROM_*
+minhash.db
+out
 
