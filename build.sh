@@ -6,4 +6,5 @@ ldflags="-s -w"
 
 GOARCH=amd64 GOOS=linux $goBinary build -gcflags "$gcflags" -ldflags "$ldflags" -o MinHashROM_linux_amd64
 GOARCH=amd64 GOOS=windows $goBinary build -gcflags "$gcflags" -ldflags "$ldflags -H=windows" -o MinHashROM_windows_amd64
+GOARCH=arm64 GOOS=darwin $goBinary build -gcflags "$gcflags" -ldflags "$ldflags -H=windows" -o MinHashROM_darwin_arm64
 
