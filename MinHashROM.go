@@ -10,8 +10,11 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/dgryski/go-farm"
 	"github.com/dgryski/go-spooky"
@@ -49,6 +52,9 @@ func main() {
 	case "MATCH":
 		mhr.args = os.Args[2:]
 		err = mhr.match()
+	case "SEARCH":
+		mhr.args = os.Args[2:]
+		err = mhr.search()
 	default:
 		mhr.mode = "MATCH"
 		mhr.args = os.Args[1:]
@@ -151,47 +157,25 @@ func (mhr minHashRom) create() error {
 	return nil
 }
 
-func (mhr minHashRom) match() error {
-	var sensitivity float64
-	var dbFile string
-	var verbose bool
+type Process struct {
+	dbData    *[]byte
+	numSigs   int
+	chunkSize int
 
-	flgs := flag.NewFlagSet(mhr.mode, flag.ExitOnError)
+	verbose     bool
+	search      bool
+	sensitivity float64
+}
 
-	flgs.Float64Var(&sensitivity, "s", 80.0, "match sensitivity")
-	flgs.StringVar(&dbFile, "db", "minhash.db", "name of minhash database file")
-	flgs.BoolVar(&verbose, "v", false, "verbose output")
-
-	flgs.Usage = func() {
-		fmt.Printf("usage: %s %s [comparison ROM]\n", mhr.programName, mhr.mode)
-		flgs.PrintDefaults()
-	}
-
-	flgs.Parse(mhr.args)
-
-	args := flgs.Args()
-	if len(args) != 1 {
-		flgs.Usage()
-		return nil
-	}
-
-	// load comparison rom
-	path, err := filepath.EvalSymlinks(args[0])
-	if err != nil {
-		return fmt.Errorf("ROM does not exist: %s", args[0])
-	}
-
-	f, err := loadROM(path)
-	if err != nil {
-		return err
-	}
-
-	// open database
-	db, err := os.Open(dbFile)
+func (p *Process) openDB(dbFile string) error {
+	dbData, err := os.ReadFile(dbFile)
 	if err != nil {
 		return fmt.Errorf("cannot open database: %s", dbFile)
 	}
-	defer db.Close()
+	db := bytes.NewReader(dbData)
+
+	// keep reference to data
+	p.dbData = &dbData
 
 	var buffer [readBlockSize]byte
 
@@ -208,54 +192,63 @@ func (mhr minHashRom) match() error {
 		return fmt.Errorf("invalid database file: unsupported version")
 	}
 
-	chunkSize := (int(buffer[2]) << 8) | int(buffer[3])
-	if chunkSize <= 0 || 4096%chunkSize != 0 {
+	p.chunkSize = (int(buffer[2]) << 8) | int(buffer[3])
+	if p.chunkSize <= 0 || 4096%p.chunkSize != 0 {
 		return fmt.Errorf("invalid database file: invalid chunk size")
 	}
 
 	// number of signatures per rom
-	numSigs := 4096 / chunkSize
+	p.numSigs = 4096 / p.chunkSize
 
-	// progress
-	if verbose {
-		fmt.Printf("matching with db file %s\nwith chunk size %d\n", dbFile, chunkSize)
-		fmt.Println("------")
+	if p.verbose {
+		fmt.Printf("matching with db file %s with chunk size %d\n", dbFile, p.chunkSize)
 	}
 
+	return nil
+}
+
+// using a copy of the Process instance. the pointer to dbData is fine to access concurrently
+// because we're only ever reading it
+func (p Process) run(f []uint8) (strings.Builder, error) {
 	// prepare minhash for comparison rom
-	cmp := minhash.New(spooky.Hash64, farm.Hash64, 4096/chunkSize)
-	for i := 0; i < len(f); i += chunkSize {
-		cmp.Push(f[i : i+chunkSize-1])
+	cmp := minhash.New(spooky.Hash64, farm.Hash64, 4096/p.chunkSize)
+	for i := 0; i < len(f); i += p.chunkSize {
+		cmp.Push(f[i : i+p.chunkSize-1])
 	}
+
+	var matches strings.Builder
 
 	var done bool
 	var matchCount int
 	var entryCount int
 
-	if verbose {
+	if p.verbose && !p.search {
 		defer func() {
-			fmt.Println("------")
 			if matchCount == 1 {
-				fmt.Printf("%d entry matched\n", matchCount)
+				fmt.Fprintf(&matches, "%d entry matched\n", matchCount)
 			} else {
-				fmt.Printf("%d entries matched\n", matchCount)
+				fmt.Fprintf(&matches, "%d entries matched\n", matchCount)
 			}
 			if entryCount == 1 {
-				fmt.Printf("%d entry checked\n", entryCount)
+				fmt.Fprintf(&matches, "%d entry checked\n", entryCount)
 			} else {
-				fmt.Printf("%d entries checked\n", entryCount)
+				fmt.Fprintf(&matches, "%d entries checked\n", entryCount)
 			}
 		}()
 	}
 
+	var buffer [readBlockSize]byte
+	db := bytes.NewReader(*p.dbData)
+	db.Seek(0, io.SeekStart)
+
 	for !done {
 		// read rom name from database
-		n, err = db.Read(buffer[:])
+		n, err := db.Read(buffer[:])
 		if err != nil {
 			if err == io.EOF {
-				return nil
+				return matches, nil
 			}
-			return fmt.Errorf("error reading database: %w", err)
+			return matches, fmt.Errorf("error reading database: %w", err)
 		}
 
 		// the amount of data read was less than the block size, this means this
@@ -264,44 +257,201 @@ func (mhr minHashRom) match() error {
 
 		n = bytes.IndexByte(buffer[:n], 0x00)
 		if n == -1 {
-			return fmt.Errorf("invalid database file: unexpected end of file")
+			return matches, fmt.Errorf("invalid database file: unexpected end of file")
 		}
 		rom := string(buffer[:n])
 
 		// position file at start of hashes for the file
 		_, err = db.Seek(-int64(len(buffer)-n-1), io.SeekCurrent)
 		if err != nil {
-			return fmt.Errorf("error reading database: %w", err)
+			return matches, fmt.Errorf("error reading database: %w", err)
 		}
 
 		// read all signatures from rom
 		var sigs []uint64
 
-		for i := 0; i < numSigs; i++ {
+		for range p.numSigs {
 			n, err = db.Read(buffer[:hashSize])
 			if err != nil {
-				return fmt.Errorf("error reading database: %w", err)
+				return matches, fmt.Errorf("error reading database: %w", err)
 			}
 			if n != hashSize {
-				return fmt.Errorf("invalid database file: unexpected end of file")
+				return matches, fmt.Errorf("invalid database file: unexpected end of file")
 			}
 
 			sig := binary.LittleEndian.Uint64(buffer[:])
 			sigs = append(sigs, sig)
 		}
 
-		mw := minhash.New(spooky.Hash64, farm.Hash64, 4096/chunkSize)
+		mw := minhash.New(spooky.Hash64, farm.Hash64, 4096/p.chunkSize)
 		mw.SetSignature(sigs)
 
 		s := minhash.Similarity(mw, cmp) * 100
-		if s >= sensitivity {
-			fmt.Printf("%6.02f%%   %s \n", s, rom)
+		if s >= p.sensitivity {
+			fmt.Fprintf(&matches, "%6.02f%%   %s \n", s, rom)
 			matchCount++
 		}
 
 		entryCount++
 	}
 
+	return matches, nil
+}
+
+func (mhr minHashRom) search() error {
+	var p Process
+
+	var dbFile string
+	var verbose bool
+	var numParallel int
+	var resume int
+
+	flgs := flag.NewFlagSet(mhr.mode, flag.ExitOnError)
+
+	flgs.Float64Var(&p.sensitivity, "s", 80.0, "match sensitivity")
+	flgs.StringVar(&dbFile, "db", "minhash.db", "name of minhash database file")
+	flgs.BoolVar(&verbose, "v", false, "verbose output")
+	flgs.IntVar(&numParallel, "n", runtime.NumCPU(), "number of parallel searches")
+	flgs.IntVar(&resume, "r", 0, "byte offset to start searching from")
+
+	flgs.Usage = func() {
+		fmt.Printf("usage: %s %s [comparison ROM]\n", mhr.programName, mhr.mode)
+		flgs.PrintDefaults()
+	}
+
+	flgs.Parse(mhr.args)
+
+	args := flgs.Args()
+	if len(args) != 1 {
+		flgs.Usage()
+		return nil
+	}
+
+	// load data file to be searched
+	path, err := filepath.EvalSymlinks(args[0])
+	if err != nil {
+		return fmt.Errorf("ROM does not exist: %s", args[0])
+	}
+	var f []byte
+	f, err = os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	// minhash database
+	err = p.openDB(dbFile)
+	err = p.openDB(dbFile)
+	if err != nil {
+		return err
+	}
+
+	// keep number of goroutines under control
+	var wg sync.WaitGroup
+
+	counter := make(chan bool, numParallel)
+	for range cap(counter) {
+		counter <- true
+	}
+
+	// errors returned from goroutine over fatalErr channel
+	fatalErr := make(chan error)
+
+	const searchBlockSize = 4096
+
+	// catch interrupts
+	intChan := make(chan os.Signal, 1)
+	signal.Notify(intChan, os.Interrupt)
+
+	// wait for all outstanding goroutines to complete
+	defer wg.Wait()
+
+	for i := range f[resume : len(f)-searchBlockSize-1] {
+		fmt.Printf("Progress: %.2f%%   \r", 100*float64(i+resume)/float64(len(f)))
+
+		// do no proceed until a count token is available
+		<-counter
+
+		wg.Go(func() {
+			// give back counter when goroutine finishes. this allows another goroutine to start
+			defer func() {
+				counter <- true
+			}()
+
+			// run search process and print out results if ok
+			matches, err := p.run(f[i : i+searchBlockSize])
+			if err != nil {
+				fatalErr <- err
+				return
+			}
+			if matches.Len() > 0 {
+				fmt.Print(matches.String())
+				fmt.Printf("[Slice at %d to %d]\n", i, i+searchBlockSize)
+			}
+		})
+
+		select {
+		case err := <-fatalErr:
+			return err
+		case <-intChan:
+			fmt.Printf("\n-----\nUser Interrupt: resume at byte %d\n", i+resume)
+			return nil
+		default:
+		}
+	}
+
+	return nil
+}
+
+func (mhr minHashRom) match() error {
+	var p Process
+
+	var dbFile string
+	var verbose bool
+
+	flgs := flag.NewFlagSet(mhr.mode, flag.ExitOnError)
+
+	flgs.Float64Var(&p.sensitivity, "s", 80.0, "match sensitivity")
+	flgs.StringVar(&dbFile, "db", "minhash.db", "name of minhash database file")
+	flgs.BoolVar(&verbose, "v", false, "verbose output")
+
+	flgs.Usage = func() {
+		fmt.Printf("usage: %s %s [comparison ROM]\n", mhr.programName, mhr.mode)
+		flgs.PrintDefaults()
+	}
+
+	flgs.Parse(mhr.args)
+
+	args := flgs.Args()
+	if len(args) != 1 {
+		flgs.Usage()
+		return nil
+	}
+
+	// open rom file to check
+	path, err := filepath.EvalSymlinks(args[0])
+	if err != nil {
+		return fmt.Errorf("ROM does not exist: %s", args[0])
+	}
+	var f []byte
+	f, err = loadROM(path)
+	if err != nil {
+		return err
+	}
+
+	// minhash database
+	err = p.openDB(dbFile)
+	if err != nil {
+		return err
+	}
+
+	// run match process and print out results if ok
+	matches, err := p.run(f)
+	if err != nil {
+		return err
+	}
+	if matches.Len() > 0 {
+		fmt.Print(matches.String())
+	}
 	return nil
 }
 
