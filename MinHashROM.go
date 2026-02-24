@@ -40,10 +40,25 @@ func main() {
 
 	var err error
 
-	// find mode
-	if len(os.Args) > 1 {
-		mhr.mode = strings.ToUpper(os.Args[1])
+	// use flag set to provide the --help flag for top level command line.
+	// that's all we want it to do
+	flgs := flag.NewFlagSet("minhashrom", flag.ContinueOnError)
+
+	args := os.Args[1:]
+
+	// parse arguments. if the help flag has been used then print out the
+	// execution modes summary and return
+	err = flgs.Parse(args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Println("Execution Modes: MATCH, SEARCH, CREATE")
+			return
+		}
+	} else {
+		args = flgs.Args()
 	}
+
+	mhr.mode = strings.ToUpper(args[0])
 
 	switch mhr.mode {
 	case "CREATE":
