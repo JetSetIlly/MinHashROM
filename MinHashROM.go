@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/md5"
 	"crypto/sha1"
 	_ "embed"
@@ -28,6 +29,10 @@ const (
 	defaultChunkSize = 64
 	readBlockSize    = 256
 	hashSize         = 8
+)
+
+const (
+	sigCompressedDB = "gzipMinHashRomDB"
 )
 
 type minHashRom struct {
@@ -89,10 +94,12 @@ func main() {
 func (mhr minHashRom) create() error {
 	var chunkSize int
 	var dbFile string
+	var compress bool
 
 	flgs := flag.NewFlagSet(mhr.mode, flag.ExitOnError)
 	flgs.IntVar(&chunkSize, "c", defaultChunkSize, "chunk size")
 	flgs.StringVar(&dbFile, "db", "minhash.db", "name of minhash database file")
+	flgs.BoolVar(&compress, "compress", true, "compress database file")
 
 	flgs.Usage = func() {
 		fmt.Printf("usage: %s %s [ROM directory]\n", mhr.programName, mhr.mode)
@@ -119,10 +126,21 @@ func (mhr minHashRom) create() error {
 	}
 	roms := args[0]
 
-	db, err := os.Create(dbFile)
+	f, err := os.Create(dbFile)
 	if err != nil {
 		return fmt.Errorf("error creating database: %w", err)
 	}
+
+	// compress data if requested
+	var db io.WriteCloser
+
+	if compress {
+		f.WriteString(sigCompressedDB)
+		db = gzip.NewWriter(f)
+	} else {
+		db = f
+	}
+
 	defer db.Close()
 
 	// write header
@@ -177,7 +195,7 @@ func (mhr minHashRom) create() error {
 }
 
 type Process struct {
-	dbData    *[]byte
+	dbData    []byte
 	numSigs   int
 	chunkSize int
 
@@ -191,29 +209,63 @@ func (p *Process) openDB(dbFile string) error {
 	if err != nil {
 		return fmt.Errorf("cannot open database: %s", dbFile)
 	}
-	db := bytes.NewReader(dbData)
-
-	// keep reference to data
-	p.dbData = &dbData
 
 	var buffer [readBlockSize]byte
 
-	// read database header
-	n, err := db.Read(buffer[:4])
+	// at this point the db reader can be compressed or uncompressed data
+	db := bytes.NewReader(dbData)
+
+	// check first few bytes for compressed data signature
+	sigLen := len(sigCompressedDB)
+	n, err := db.Read(buffer[:sigLen])
 	if err != nil {
-		return fmt.Errorf("error reading database: %w", err)
+		return fmt.Errorf("cannot open database: %s: %w", dbFile, err)
 	}
-	if n != 4 {
-		return fmt.Errorf("invalid database file: no header found")
+	if n != len(sigCompressedDB) {
+		return fmt.Errorf("cannot open database: %s: file too short", dbFile)
 	}
 
+	// if database file has the compressed db signature then replace db with the uncompressed data
+	if string(buffer[:sigLen]) == sigCompressedDB {
+		z, err := gzip.NewReader(db)
+		if err != nil {
+			return fmt.Errorf("cannot open database: %s: %w", dbFile, err)
+		}
+
+		dbData, err = io.ReadAll(z)
+		if err != nil {
+			return fmt.Errorf("cannot open database: %s: %w", dbFile, err)
+		}
+
+		db = bytes.NewReader(dbData)
+	}
+
+	// make sure we're at beginning of data
+	db.Seek(0, io.SeekStart)
+
+	// copy of uncompressed dbData. we don't store the reader because we want to be able to read the
+	// data concurrently and we need a new reader for each goroutine
+	p.dbData = dbData
+
+	// at this point db is definitely uncompressed data
+
+	// read database header
+	n, err = db.Read(buffer[:4])
+	if err != nil {
+		return fmt.Errorf("error reading database: %s %w", dbFile, err)
+	}
+	if n != 4 {
+		return fmt.Errorf("invalid database file: %s: no header found", dbFile)
+	}
+
+	// check for validity
 	if supportedVersion != (int(buffer[0])<<8)|int(buffer[1]) {
-		return fmt.Errorf("invalid database file: unsupported version")
+		return fmt.Errorf("invalid database file: %s: unsupported version", dbFile)
 	}
 
 	p.chunkSize = (int(buffer[2]) << 8) | int(buffer[3])
 	if p.chunkSize <= 0 || 4096%p.chunkSize != 0 {
-		return fmt.Errorf("invalid database file: invalid chunk size")
+		return fmt.Errorf("invalid database file: %s: invalid chunk size", dbFile)
 	}
 
 	// number of signatures per rom
@@ -257,7 +309,7 @@ func (p Process) run(f []uint8) (strings.Builder, error) {
 	}
 
 	var buffer [readBlockSize]byte
-	db := bytes.NewReader(*p.dbData)
+	db := bytes.NewReader(p.dbData)
 	db.Seek(0, io.SeekStart)
 
 	for !done {
@@ -356,7 +408,6 @@ func (mhr minHashRom) search() error {
 	}
 
 	// minhash database
-	err = p.openDB(dbFile)
 	err = p.openDB(dbFile)
 	if err != nil {
 		return err
