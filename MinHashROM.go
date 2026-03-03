@@ -60,7 +60,9 @@ func main() {
 		args = flgs.Args()
 	}
 
-	mhr.mode = strings.ToUpper(args[0])
+	if len(args) != 0 {
+		mhr.mode = strings.ToUpper(args[0])
+	}
 
 	switch mhr.mode {
 	case "CREATE":
