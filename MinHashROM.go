@@ -205,7 +205,6 @@ type Process struct {
 	chunkSize int
 
 	verbose     bool
-	search      bool
 	sensitivity float64
 }
 
@@ -285,7 +284,7 @@ func (p *Process) openDB(dbFile string) error {
 
 // using a copy of the Process instance. the pointer to dbData is fine to access concurrently
 // because we're only ever reading it
-func (p Process) run(f []uint8) (matches strings.Builder, err error) {
+func (p Process) run(f []uint8, search bool) (matches strings.Builder, err error) {
 	// prepare minhash for comparison rom
 	cmp := minhash.New(spooky.Hash64, farm.Hash64, 4096/p.chunkSize)
 	for i := 0; i < len(f); i += p.chunkSize {
@@ -296,7 +295,7 @@ func (p Process) run(f []uint8) (matches strings.Builder, err error) {
 	var matchCount int
 	var entryCount int
 
-	if p.verbose && !p.search {
+	if p.verbose && !search {
 		defer func() {
 			fmt.Fprintf(&matches, "\n")
 			if matchCount == 1 {
@@ -383,6 +382,7 @@ func (mhr minHashRom) search() error {
 	flgs := flag.NewFlagSet(mhr.mode, flag.ExitOnError)
 
 	flgs.Float64Var(&p.sensitivity, "s", 80.0, "match sensitivity")
+	flgs.BoolVar(&p.verbose, "v", false, "verbose output")
 	flgs.StringVar(&dbFile, "db", "minhash.db", "name of minhash database file")
 	flgs.IntVar(&numParallel, "n", runtime.NumCPU(), "number of parallel searches")
 	flgs.IntVar(&resume, "r", 0, "byte offset to start searching from")
@@ -450,7 +450,7 @@ func (mhr minHashRom) search() error {
 			}()
 
 			// run search process and print out results if ok
-			matches, err := p.run(f[i : i+searchBlockSize])
+			matches, err := p.run(f[i:i+searchBlockSize], true)
 			if err != nil {
 				fatalErr <- err
 				return
@@ -519,7 +519,7 @@ func (mhr minHashRom) match() error {
 	}
 
 	// run match process and print out results if ok
-	matches, err := p.run(f)
+	matches, err := p.run(f, false)
 	if err != nil {
 		return err
 	}
