@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/md5"
+	"crypto/sha1"
 	_ "embed"
 	"encoding/binary"
 	"errors"
@@ -317,7 +319,6 @@ func (mhr minHashRom) search() error {
 	var p Process
 
 	var dbFile string
-	var verbose bool
 	var numParallel int
 	var resume int
 
@@ -325,7 +326,6 @@ func (mhr minHashRom) search() error {
 
 	flgs.Float64Var(&p.sensitivity, "s", 80.0, "match sensitivity")
 	flgs.StringVar(&dbFile, "db", "minhash.db", "name of minhash database file")
-	flgs.BoolVar(&verbose, "v", false, "verbose output")
 	flgs.IntVar(&numParallel, "n", runtime.NumCPU(), "number of parallel searches")
 	flgs.IntVar(&resume, "r", 0, "byte offset to start searching from")
 
@@ -448,7 +448,11 @@ func (mhr minHashRom) match() error {
 		return fmt.Errorf("ROM does not exist: %s", args[0])
 	}
 	var f []byte
-	f, err = loadROM(path)
+	if verbose {
+		f, err = loadROM(path, os.Stdout)
+	} else {
+		f, err = loadROM(path, nil)
+	}
 	if err != nil {
 		return err
 	}
@@ -481,7 +485,7 @@ func (mhr minHashRom) walkRomDirectory(roms string, chunkSize int, hook func(str
 			return nil
 		}
 
-		f, err := loadROM(path)
+		f, err := loadROM(path, nil)
 		if err != nil {
 			if errors.Is(err, unsupportedFileSize) {
 				return nil
@@ -510,10 +514,17 @@ func (mhr minHashRom) walkRomDirectory(roms string, chunkSize int, hook func(str
 
 var unsupportedFileSize = errors.New("unsupported file size")
 
-func loadROM(path string) ([]byte, error) {
+func loadROM(path string, verbose io.Writer) ([]byte, error) {
 	f, err := os.ReadFile(path)
 	if err != nil {
 		return []byte{}, fmt.Errorf("error opening %s", path)
+	}
+
+	if verbose != nil {
+		fmt.Fprintf(verbose, "file: %s\n", path)
+		fmt.Fprintf(verbose, " md5: %x\n", md5.Sum(f))
+		fmt.Fprintf(verbose, "sha1: %x\n", sha1.Sum(f))
+		fmt.Fprintln(verbose, "")
 	}
 
 	if len(f) == 2048 {
