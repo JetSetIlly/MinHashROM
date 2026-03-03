@@ -277,7 +277,7 @@ func (p *Process) openDB(dbFile string) error {
 	p.numSigs = 4096 / p.chunkSize
 
 	if p.verbose {
-		fmt.Printf("matching with db file %s with chunk size %d\n", dbFile, p.chunkSize)
+		fmt.Printf("using db file %s with chunk size %d\n", dbFile, p.chunkSize)
 	}
 
 	return nil
@@ -285,14 +285,12 @@ func (p *Process) openDB(dbFile string) error {
 
 // using a copy of the Process instance. the pointer to dbData is fine to access concurrently
 // because we're only ever reading it
-func (p Process) run(f []uint8) (strings.Builder, error) {
+func (p Process) run(f []uint8) (matches strings.Builder, err error) {
 	// prepare minhash for comparison rom
 	cmp := minhash.New(spooky.Hash64, farm.Hash64, 4096/p.chunkSize)
 	for i := 0; i < len(f); i += p.chunkSize {
 		cmp.Push(f[i : i+p.chunkSize-1])
 	}
-
-	var matches strings.Builder
 
 	var done bool
 	var matchCount int
@@ -300,6 +298,7 @@ func (p Process) run(f []uint8) (strings.Builder, error) {
 
 	if p.verbose && !p.search {
 		defer func() {
+			fmt.Fprintf(&matches, "\n")
 			if matchCount == 1 {
 				fmt.Fprintf(&matches, "%d entry matched\n", matchCount)
 			} else {
@@ -477,15 +476,13 @@ func (mhr minHashRom) search() error {
 
 func (mhr minHashRom) match() error {
 	var p Process
-
 	var dbFile string
-	var verbose bool
 
 	flgs := flag.NewFlagSet(mhr.mode, flag.ExitOnError)
 
 	flgs.Float64Var(&p.sensitivity, "s", 80.0, "match sensitivity")
+	flgs.BoolVar(&p.verbose, "v", false, "verbose output")
 	flgs.StringVar(&dbFile, "db", "minhash.db", "name of minhash database file")
-	flgs.BoolVar(&verbose, "v", false, "verbose output")
 
 	flgs.Usage = func() {
 		fmt.Printf("usage: %s %s [comparison ROM]\n", mhr.programName, mhr.mode)
@@ -506,7 +503,7 @@ func (mhr minHashRom) match() error {
 		return fmt.Errorf("ROM does not exist: %s", args[0])
 	}
 	var f []byte
-	if verbose {
+	if p.verbose {
 		f, err = loadROM(path, os.Stdout)
 	} else {
 		f, err = loadROM(path, nil)
