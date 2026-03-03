@@ -51,6 +51,11 @@ func main() {
 	// that's all we want it to do
 	flgs := flag.NewFlagSet("minhashrom", flag.ContinueOnError)
 
+	// setting flag output to the nilWriter because we need to control how
+	// unrecognised arguments are displayed
+	flgs.SetOutput(&nilWriter{})
+
+	// first argument is always the invoked program name
 	args := os.Args[1:]
 
 	// parse arguments. if the help flag has been used then print out the
@@ -590,4 +595,12 @@ func loadROM(path string, verbose io.Writer) ([]byte, error) {
 		// files shorter than 4096 but not 2048 are not supported
 		return []byte{}, fmt.Errorf("%w: file size: %d bytes", unsupportedFileSize, len(f))
 	}
+}
+
+// nilWriter is used by the top level FlagSet. we want to be able to provide arguments to the
+// default mode without complaining from the top level
+type nilWriter struct{}
+
+func (*nilWriter) Write(p []byte) (n int, err error) {
+	return 0, nil
 }
