@@ -45,48 +45,41 @@ func main() {
 	var mhr minHashRom
 	mhr.programName = filepath.Base(os.Args[0])
 
-	var err error
-
-	// use flag set to provide the --help flag for top level command line.
-	// that's all we want it to do
-	flgs := flag.NewFlagSet("minhashrom", flag.ContinueOnError)
-
-	// setting flag output to the nilWriter because we need to control how
-	// unrecognised arguments are displayed
-	flgs.SetOutput(&nilWriter{})
-
-	// first argument is always the invoked program name
 	args := os.Args[1:]
 
-	// parse arguments. if the help flag has been used then print out the
-	// execution modes summary and return
-	err = flgs.Parse(args)
-	if err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			fmt.Println("Execution Modes: MATCH, SEARCH, CREATE")
-			return
-		}
-	} else {
-		args = flgs.Args()
+	printUsage := func() {
+		fmt.Println("Usage: minhashrom [Execution Mode] ...")
+		fmt.Println("Execution Modes:")
+		fmt.Println("\t MATCH: compare a single ROM against the database")
+		fmt.Println("\tSEARCH: search a large file for data that is similar to entries in the database")
+		fmt.Println("\tCREATE: create a new database")
 	}
 
-	if len(args) != 0 {
-		mhr.mode = strings.ToUpper(args[0])
+	if len(args) == 0 {
+		printUsage()
+		return
 	}
+
+	mhr.mode = strings.ToUpper(args[0])
+
+	var err error
 
 	switch mhr.mode {
+	case "--HELP", "-HELP", "HELP":
+		printUsage()
+		return
 	case "CREATE":
-		mhr.args = os.Args[2:]
+		mhr.args = args[1:]
 		err = mhr.create()
 	case "MATCH":
-		mhr.args = os.Args[2:]
+		mhr.args = args[1:]
 		err = mhr.match()
 	case "SEARCH":
-		mhr.args = os.Args[2:]
+		mhr.args = args[1:]
 		err = mhr.search()
 	default:
 		mhr.mode = "MATCH"
-		mhr.args = os.Args[1:]
+		mhr.args = args
 		err = mhr.match()
 	}
 
@@ -592,12 +585,4 @@ func loadROM(path string, verbose io.Writer) ([]byte, error) {
 		// files shorter than 4096 but not 2048 are not supported
 		return []byte{}, fmt.Errorf("%w: file size: %d bytes", unsupportedFileSize, len(f))
 	}
-}
-
-// nilWriter is used by the top level FlagSet. we want to be able to provide arguments to the
-// default mode without complaining from the top level
-type nilWriter struct{}
-
-func (*nilWriter) Write(p []byte) (n int, err error) {
-	return 0, nil
 }
